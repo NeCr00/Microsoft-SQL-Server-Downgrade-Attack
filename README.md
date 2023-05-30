@@ -24,7 +24,7 @@ Follow the steps below to perform the downgrade attack:
     
 2. Run the `MitM_Preparation.sh` script:
 ```shell
-sudo bash MitM_Preparation.sh
+sudo  ./MitM_Preparation.sh
 ```
 
 This script sets up the firewall rules and performs ARP spoofing for the MITM attack. You will be prompted to provide the following information:
